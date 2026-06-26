@@ -25,7 +25,7 @@
 | Validation | Pydantic v2 |
 | HTTP client | httpx |
 | Classification | Deterministic regex rules (priority-ordered) |
-| LLM enrichment | Optional — Google Gemini 1.5 Flash / OpenAI GPT-4o-mini |
+| LLM enrichment | Optional — Google Gemini 1.5 Flash |
 | Safety | Post-generation regex sanitiser (always applied) |
 | Testing | pytest + FastAPI TestClient |
 
@@ -67,7 +67,7 @@ POST /analyze-ticket
                  ▼
 ┌─────────────────────────────────────────┐
 │  llm.py — Optional LLM enrichment       │
-│  Gemini 1.5 Flash → OpenAI GPT-4o-mini  │
+│  Google Gemini 1.5 Flash              │
 │  Falls back silently on failure         │
 └────────────────┬────────────────────────┘
                  │
@@ -102,7 +102,6 @@ Prompt-injection attempts embedded in complaint text are logged and ignored — 
 | Model | Provider | Usage | Why chosen |
 |---|---|---|---|
 | Gemini 1.5 Flash | Google AI | Optional enrichment of `agent_summary` and `customer_reply` | Fast, low-cost, JSON mode |
-| GPT-4o-mini | OpenAI | Fallback enrichment if Gemini unavailable | Reliable JSON output |
 | Deterministic templates | None (local) | Primary/fallback response generation | Zero latency, zero cost, 100% safe |
 
 > An LLM is **not required** to run this service. All responses are generated deterministically if no API key is set.
@@ -127,7 +126,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env to add GEMINI_API_KEY or OPENAI_API_KEY if desired
+# Edit .env to add GEMINI_API_KEY if desired
 ```
 
 ### Run
