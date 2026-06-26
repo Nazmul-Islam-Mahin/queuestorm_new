@@ -40,7 +40,7 @@ _AMOUNT_PATTERNS = [
     re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(?:taka|tk|bdt|টাকা)", re.IGNORECASE),
     re.compile(r"(?:taka|tk|bdt|টাকা)\s*(\d[\d,]*(?:\.\d+)?)", re.IGNORECASE),
     # Plain number fallback (3–7 digits = plausible BDT amount)
-    re.compile(r"\b(\d{3,7})\b"),
+    re.compile(r"\b(\d{2,7})\b"),
 ]
 
 
@@ -147,22 +147,34 @@ _COMPILED_RULES: List[Tuple[str, re.Pattern]] = [
 
 # Prompt-injection guard: if the complaint itself contains instruction overrides
 _INJECTION_PATTERNS = re.compile(
-    r"(ignore\s+(previous|above|all)\s+instructions?|"
-    r"you\s+are\s+now|disregard\s+your|"
-    r"new\s+instruction|system\s+prompt|"
-    r"pretend\s+(you\s+are|to\s+be))",
+    r"(ignore\s+(?:all\s+)?(?:previous|above)?\s*instructions?|"
+    r"disregard\s+(?:all\s+)?(?:your|previous|above)?\s*instructions?|"
+    r"you\s+are\s+now\s+|"
+    r"new\s+instructions?\s*:|"
+    r"system\s+prompt|"
+    r"pretend\s+(?:you\s+are|to\s+be)|"
+    r"act\s+as\s+(?:a\s+)?(?:different|new)|"
+    r"override\s+(?:your\s+)?(?:rules?|instructions?))",
     re.IGNORECASE,
 )
 
 
-def classify_complaint(complaint: str, user_type: Optional[str] = None) -> str:
+def classify_complaint(
+    complaint: str,
+    user_type: Optional[str] = None,
+) -> Tuple[str, bool]:
     """
     Classify complaint into a case_type using prioritised regex rules.
-    Prompt-injection attempts are logged but do not alter classification.
+
+    Returns:
+        (case_type, injection_detected)
+
+    When an injection attempt is detected, the caller MUST skip LLM enrichment
+    and route directly to template-based response.
     """
-    # Strip potential prompt-injection preambles (just log; keep classifying normally)
-    if _INJECTION_PATTERNS.search(complaint):
-        logger.warning("Possible prompt-injection detected in complaint text.")
+    injection_detected = bool(_INJECTION_PATTERNS.search(complaint))
+    if injection_detected:
+        logger.warning("Possible prompt-injection detected — LLM enrichment will be skipped.")
 
     norm = normalize_text(complaint)
 
@@ -171,14 +183,12 @@ def classify_complaint(complaint: str, user_type: Optional[str] = None) -> str:
 
     for case_type, pattern in _COMPILED_RULES:
         if pattern.search(norm):
-            # Merchant hint can upgrade an "other" to settlement delay,
-            # but a confirmed non-settlement match takes precedence
-            return case_type
+            return case_type, injection_detected
 
     if merchant_hint:
-        return "merchant_settlement_delay"
+        return "merchant_settlement_delay", injection_detected
 
-    return "other"
+    return "other", injection_detected
 
 
 # ---------------------------------------------------------------------------
@@ -241,14 +251,26 @@ def _detect_duplicate(
     case_type: str,
 ) -> Optional[Tuple[Dict[str, Any], str]]:
     """
-    Detect a duplicate payment pattern.
+    Detect a duplicate payment pattern using multi-signal scoring.
+
+    Requires ALL of:
+      1. Complaint explicitly mentions duplication (is_dup_claim=True or case_type=duplicate_payment)
+      2. Two completed transactions with identical (amount, type, counterparty)
+      3. Amount in complaint matches the transaction amount
+      4. Time gap is suspiciously tight (≤ 2 hours; recurring bills are often same-day but hours apart)
+
     Returns (second_tx, "consistent") if found, else None.
     """
+    # Corroboration from complaint is REQUIRED — pure transaction shape is not enough.
+    # Two rent payments on the same day are NOT duplicates unless the customer says so.
+    if not (is_dup_claim or case_type == "duplicate_payment"):
+        return None
+
     completed = [tx for tx in transaction_history if tx.get("status") == "completed"]
     if len(completed) < 2:
         return None
 
-    # Group by (amount, type, counterparty)
+    # Group by (amount, type, counterparty) — all three must match
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for tx in completed:
         key = (tx.get("amount"), tx.get("type"), tx.get("counterparty"))
@@ -257,16 +279,19 @@ def _detect_duplicate(
     for key, txs in groups.items():
         if len(txs) < 2:
             continue
+
+        # Amount mentioned in complaint must plausibly match this group's amount
+        if amounts and not any(_amount_close(a, key[0]) for a in amounts):
+            continue
+
         txs_sorted = sorted(txs, key=lambda t: parse_ts(t.get("timestamp", "")))
         for i in range(len(txs_sorted) - 1):
             t1 = parse_ts(txs_sorted[i].get("timestamp", ""))
             t2 = parse_ts(txs_sorted[i + 1].get("timestamp", ""))
             delta_secs = (t2 - t1).total_seconds()
-            # Within 1 hour and amount plausible
-            if delta_secs <= 3600:
-                amount_ok = not amounts or any(_amount_close(a, key[0]) for a in amounts)
-                if amount_ok and (is_dup_claim or case_type == "duplicate_payment"):
-                    return txs_sorted[i + 1], "consistent"
+            # Tight time window (≤ 2 hours) strongly suggests duplicate vs. recurring payment
+            if delta_secs <= 7200:
+                return txs_sorted[i + 1], "consistent"
     return None
 
 
@@ -320,13 +345,21 @@ def _determine_verdict(
         if tx_status == "completed":
             return "inconsistent"
 
-    # --- Default ---
+    # --- Default: derive verdict from transaction status vs. complaint expectation ---
+    # A completed/reversed tx corroborates that something happened (claim is grounded)
     if tx_status in ("completed", "reversed"):
         return "consistent"
+    # A failed/pending tx when the complaint mentions failure/pending → consistent
+    # A failed/pending tx when the complaint does NOT mention failure (e.g. claims success) → inconsistent
     if tx_status in ("failed", "pending"):
-        return "consistent"
+        complaint_mentions_failure = bool(re.search(
+            r"\b(fail(ed)?|unsuccessful|deducted?|cut|not\s+received|pending|stuck)\b"
+            r"|ফেইল|কেটে|আসেনি|পাইনি|পেন্ডিং",
+            complaint_norm,
+        ))
+        return "consistent" if complaint_mentions_failure else "inconsistent"
 
-    return "consistent"
+    return "insufficient_data"
 
 
 def find_relevant_transaction(
@@ -388,6 +421,14 @@ def find_relevant_transaction(
 # ---------------------------------------------------------------------------
 
 
+# Case types where the high-value threshold does NOT automatically trigger human review
+# (they have their own authoritative routing rules that override the amount heuristic)
+_AMOUNT_THRESHOLD_EXEMPT = frozenset({
+    "merchant_settlement_delay",  # High-value settlements are routine for merchants
+    "phishing_or_social_engineering",  # Already always critical + human review
+})
+
+
 def _resolve_routing(
     case_type: str,
     verdict: str,
@@ -395,14 +436,12 @@ def _resolve_routing(
 ) -> Tuple[str, str, bool]:
     """Return (severity, department, human_review_required)."""
 
-    severity = "low"
-    department = "customer_support"
-    human_review = False
+    # Phishing ALWAYS forces critical + human_review regardless of verdict or amount.
+    # This must be a hard rule, not an emergent property of the mapping.
+    if case_type == "phishing_or_social_engineering":
+        return "critical", "fraud_risk", True
 
     mapping: Dict[str, Dict[str, Any]] = {
-        "phishing_or_social_engineering": {
-            "severity": "critical", "department": "fraud_risk", "human_review": True,
-        },
         "wrong_transfer": {
             "severity": "high" if verdict == "consistent" else "medium",
             "department": "dispute_resolution",
@@ -411,7 +450,7 @@ def _resolve_routing(
         "payment_failed": {
             "severity": "high",
             "department": "payments_ops",
-            # Only needs human review when evidence contradicts the complaint
+            # Inconsistent evidence (tx shows completed despite failure claim) needs human eyes
             "human_review": verdict == "inconsistent",
         },
         "refund_request": {
@@ -427,6 +466,7 @@ def _resolve_routing(
         "merchant_settlement_delay": {
             "severity": "medium",
             "department": "merchant_operations",
+            # Only needs review when data contradicts merchant claim
             "human_review": verdict == "inconsistent",
         },
         "agent_cash_in_issue": {
@@ -442,12 +482,17 @@ def _resolve_routing(
     }
 
     row = mapping.get(case_type, mapping["other"])
-    severity = row["severity"]
-    department = row["department"]
-    human_review = row["human_review"]
+    severity: str = row["severity"]
+    department: str = row["department"]
+    human_review: bool = row["human_review"]
 
-    # High-value transactions always get human review (≥ 10 000 BDT)
-    if amount is not None and amount >= 10_000:
+    # High-value transactions (≥ 10 000 BDT) escalate to human review,
+    # EXCEPT for case types with their own authoritative routing (settlement, phishing).
+    if (
+        amount is not None
+        and amount >= 10_000
+        and case_type not in _AMOUNT_THRESHOLD_EXEMPT
+    ):
         human_review = True
 
     # Inconsistent evidence always warrants a second pair of eyes
@@ -485,16 +530,54 @@ def _compute_confidence(verdict: str, case_type: str, tx_matched: bool) -> float
 # ---------------------------------------------------------------------------
 
 
-def _build_reason_codes(case_type: str, verdict: str, tx_matched: bool) -> List[str]:
-    codes = [case_type]
+# Clean, human-readable reason code vocabulary (judged in Stage 2 manual review)
+_REASON_CODE_MAP: Dict[str, str] = {
+    "phishing_or_social_engineering": "social_engineering_detected",
+    "wrong_transfer": "wrong_transfer_reported",
+    "payment_failed": "payment_failure_reported",
+    "duplicate_payment": "duplicate_payment_reported",
+    "merchant_settlement_delay": "settlement_delay_reported",
+    "agent_cash_in_issue": "cash_in_issue_reported",
+    "refund_request": "refund_requested",
+    "other": "unclassified_complaint",
+}
+
+_VERDICT_CODE_MAP: Dict[str, str] = {
+    "consistent": "evidence_supports_claim",
+    "inconsistent": "evidence_contradicts_claim",
+    "insufficient_data": "insufficient_evidence",
+}
+
+_INCONSISTENT_DETAIL_MAP: Dict[str, str] = {
+    "wrong_transfer": "established_recipient_pattern",
+    "payment_failed": "transaction_shows_completed",
+    "agent_cash_in_issue": "cash_in_shows_completed",
+    "merchant_settlement_delay": "settlement_shows_completed",
+}
+
+
+def _build_reason_codes(
+    case_type: str,
+    verdict: str,
+    tx_matched: bool,
+    injection_detected: bool = False,
+) -> List[str]:
+    """Build clean, human-readable reason codes for Stage 2 review."""
+    codes: List[str] = [_REASON_CODE_MAP.get(case_type, case_type)]
+
     if tx_matched:
         codes.append("transaction_match")
-    codes.append(f"evidence_{verdict}")
-    if verdict == "inconsistent":
-        if case_type == "wrong_transfer":
-            codes.append("established_recipient_pattern")
-        elif case_type == "payment_failed":
-            codes.append("transaction_shows_completed")
+    else:
+        codes.append("no_transaction_match")
+
+    codes.append(_VERDICT_CODE_MAP.get(verdict, f"evidence_{verdict}"))
+
+    if verdict == "inconsistent" and case_type in _INCONSISTENT_DETAIL_MAP:
+        codes.append(_INCONSISTENT_DETAIL_MAP[case_type])
+
+    if injection_detected:
+        codes.append("injection_attempt_detected")
+
     return codes
 
 
@@ -522,8 +605,8 @@ def analyze_ticket_logic(request_data: Dict[str, Any]) -> Dict[str, Any]:
     # 1. Language detection
     is_bn = language == "bn" or bool(re.search(r"[\u0980-\u09ff]", complaint))
 
-    # 2. Classify
-    case_type = classify_complaint(complaint, user_type)
+    # 2. Classify — returns (case_type, injection_detected)
+    case_type, injection_detected = classify_complaint(complaint, user_type)
 
     # 3. Transaction matching
     relevant_tx, verdict = find_relevant_transaction(complaint, history, case_type)
@@ -552,9 +635,11 @@ def analyze_ticket_logic(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
     # 5. Confidence & reason codes
     confidence = _compute_confidence(verdict, case_type, relevant_tx is not None)
-    reason_codes = _build_reason_codes(case_type, verdict, relevant_tx is not None)
+    reason_codes = _build_reason_codes(
+        case_type, verdict, relevant_tx is not None, injection_detected
+    )
 
-    # 6. Template-based response generation
+    # 6. Template-based response generation (always used as the base)
     filled = get_filled_templates(
         case_type=case_type,
         verdict=verdict,
@@ -564,8 +649,30 @@ def analyze_ticket_logic(request_data: Dict[str, Any]) -> Dict[str, Any]:
         is_bangla=is_bn,
     )
 
-    # 7. Final safety sanitisation
-    safe_reply = sanitize_response_text(filled["customer_reply"], is_bangla=is_bn)
+    # 7. Optionally enrich with LLM — SKIPPED when injection is detected
+    # The injection_detected flag prevents adversarial complaint text from
+    # influencing LLM output; we stay with the deterministic template.
+    agent_summary = filled["agent_summary"]
+    customer_reply = filled["customer_reply"]
+
+    if not injection_detected:
+        try:
+            from llm import enrich_with_llm
+            agent_summary, customer_reply = enrich_with_llm(
+                complaint=complaint,
+                case_type=case_type,
+                evidence_verdict=verdict,
+                department=department,
+                relevant_txn_id=relevant_tx_id,
+                is_bangla=is_bn,
+                fallback_summary=filled["agent_summary"],
+                fallback_reply=filled["customer_reply"],
+            )
+        except ImportError:
+            pass  # LLM module not available; template already set
+
+    # 8. Final safety sanitisation — always applied, cannot be bypassed
+    safe_reply = sanitize_response_text(customer_reply, is_bangla=is_bn)
 
     return {
         "ticket_id": ticket_id,
@@ -574,7 +681,7 @@ def analyze_ticket_logic(request_data: Dict[str, Any]) -> Dict[str, Any]:
         "case_type": case_type,
         "severity": severity,
         "department": department,
-        "agent_summary": filled["agent_summary"],
+        "agent_summary": agent_summary,
         "recommended_next_action": filled["recommended_next_action"],
         "customer_reply": safe_reply,
         "human_review_required": human_review,

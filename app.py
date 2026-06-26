@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import HOST, PORT, logger
 from investigator import analyze_ticket_logic
@@ -58,6 +58,8 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 class TransactionHistoryEntry(BaseModel):
     """A single entry in a customer's recent transaction history."""
+    model_config = ConfigDict(extra="ignore")  # Tolerate undocumented harness fields
+
     transaction_id: str = Field(..., description="Unique transaction identifier")
     timestamp: str = Field(..., description="ISO 8601 timestamp")
     type: str = Field(..., description="One of: transfer, payment, cash_in, cash_out, settlement, refund")
@@ -84,6 +86,8 @@ class TransactionHistoryEntry(BaseModel):
 
 class TicketRequest(BaseModel):
     """Inbound ticket payload for POST /analyze-ticket."""
+    model_config = ConfigDict(extra="ignore")  # Silently ignore unknown fields from harness
+
     ticket_id: str = Field(..., description="Unique ticket identifier")
     complaint: str = Field(..., description="Customer complaint text (en / bn / mixed)")
     language: Optional[str] = Field(None, description="One of: en, bn, mixed")

@@ -21,36 +21,48 @@ _CREDENTIAL_TERMS = re.compile(
     re.IGNORECASE,
 )
 
-# Safe negation phrases — text that WARNS customers NOT to share credentials
-# (these are always allowed and expected in our templates)
-_SAFE_NEGATIONS = re.compile(
+# Asking / requesting credential patterns — dangerous requests.
+# CRITICAL: We use a negative-lookbehind to ensure a preceding negation
+# (do not, don't, never, please do not) is NOT present within 40 chars before.
+# This prevents "do not share your PIN" from matching as a request.
+_CREDENTIAL_REQUESTS = re.compile(
+    # Positive request verbs followed by credential terms — no preceding negation allowed
+    r"(?<!\bdo not\s)(?<!\bdon't\s)(?<!\bnever\s)"
+    r"\b(please\s+)?(share|send|give|provide|enter|tell|type|write)\s+"
+    r"(your|me\s+your|us\s+your)\s+"
+    r"(otp|pin|password|card\s*number|cvv)\b"
+    r"|\b(otp|pin|password)\s+(se|ko)\s+(share|bhejo|batao)\b",  # Hinglish
+    re.IGNORECASE,
+)
+
+# Broad negation guard: checks if a credential request co-occurs with "do not / don't / never"
+# anywhere in the text — used to filter out false positives from _CREDENTIAL_REQUESTS
+_NEGATION_GUARD = re.compile(
     r"\b(do\s+not|don'?t|never|please\s+do\s+not)\s+(share|give|send|provide|enter|tell)\b"
     r"|করবেন\s+না|শেয়ার\s+করবেন\s+না|বলবেন\s+না|দেবেন\s+না",
     re.IGNORECASE,
 )
 
-# Asking / requesting credential patterns — dangerous requests (without a "don't" prefix)
-_CREDENTIAL_REQUESTS = re.compile(
-    r"\b(please\s+)?(share|send|give|provide|enter|tell|type|write)\s+(your|me\s+your|us\s+your)\s+"
-    r"(otp|pin|password|card\s*number|cvv)\b"
-    r"|\b(otp|pin|password)\s+(se|ko)\s+(share|bhejo|batao)\b",  # Hinglish variants
-    re.IGNORECASE,
-)
-
-# Unauthorized refund / reversal promises
+# Unauthorized refund / reversal promises (English + Bangla)
 _REFUND_PROMISES = re.compile(
     r"\b(we\s+will|we'll|i\s+will|i'll)\s+(refund|reverse|credit|unblock|recover\s+your)\b"
     r"|\b(refund|reversal|unblock)\s+(is|has\s+been|was)\s+(initiated|processed|completed|done|guaranteed|approved)\b"
     r"|\bwe\s+will\s+return\s+your\s+money\b"
-    r"|\bআমরা\s+(টাকা|অর্থ)\s+ফেরত\s+দেব\b"
-    r"|\bটাকা\s+ফেরত\s+দেওয়া\s+হবে\b",
+    # Bangla refund promises
+    r"|আমরা\s+(টাকা|অর্থ)\s+ফেরত\s+দেব"
+    r"|টাকা\s+ফেরত\s+দেওয়া\s+হবে"
+    r"|রিফান্ড\s+(করা\s+হবে|দেওয়া\s+হবে|প্রক্রিয়া\s+করা\s+হয়েছে)",
     re.IGNORECASE,
 )
 
-# Suspicious third-party redirects
+# Suspicious third-party redirects (English + Bangla)
 _THIRD_PARTY = re.compile(
     r"\bcontact\s+(via\s+)?(whatsapp|telegram|facebook|imo|viber|messenger)\b"
-    r"|\bcall\s+this\s+number\b",
+    r"|\bcall\s+this\s+number\b"
+    # Bangla third-party patterns
+    r"|হোয়াটসঅ্যাপ|টেলিগ্রাম|ফেসবুক\s+মেসেঞ্জার"
+    r"|এই\s+নম্বরে\s+(ফোন|কল)\s+করুন"
+    r"|অন্য\s+কোনো\s+নম্বরে\s+যোগাযোগ",
     re.IGNORECASE,
 )
 
@@ -64,23 +76,29 @@ def is_reply_safe(text: str) -> bool:
     """
     Return True if `text` does not violate any safety rules.
 
-    Logic for credentials:
-      - If a credential TERM is present AND there is a safe negation near it → OK (warning style)
-      - If a credential TERM is present AND an active REQUEST pattern is found → UNSAFE
+    Credential logic (strict — no negation escape hatch):
+      - If an active credential REQUEST pattern is found → UNSAFE, full stop.
+        Exception: if the ENTIRE text contains ONLY negation-framed mentions
+        (e.g. "do not share your PIN") and NO affirmative request verb pair,
+        it is safe. We detect this by requiring a negation guard match to
+        override a credential-term hit when no explicit request verb is found.
     """
-    # Rule 1: Credential requests
+    # Rule 1: Credential requests — strict, no negation exception for requests
     if _CREDENTIAL_TERMS.search(text):
-        # Check whether this is a "do not share…" style warning (safe)
-        has_safe_negation = bool(_SAFE_NEGATIONS.search(text))
         has_active_request = bool(_CREDENTIAL_REQUESTS.search(text))
+        has_negation = bool(_NEGATION_GUARD.search(text))
 
-        # If there IS an active credential request in addition to (or instead of) a warning → unsafe
         if has_active_request:
+            # Even with a negation somewhere, an active request is still unsafe.
+            # e.g. "Please share your OTP. Do not worry." → UNSAFE
             return False
-        # If credentials are mentioned but only in a negation context → safe (our templates do this)
-        if not has_safe_negation:
-            # Credential term present with neither negation nor request — borderline; be conservative
+
+        if not has_negation:
+            # Credential term present but no negation framing and no explicit request
+            # verb found — conservative rejection (could be echoed from complaint).
             return False
+        # has_negation=True and has_active_request=False → safe warning-style mention
+        # e.g. "Please do not share your PIN or OTP with anyone." → SAFE
 
     # Rule 2: Unauthorized refund/reversal promises
     if _REFUND_PROMISES.search(text):
